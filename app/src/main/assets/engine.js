@@ -202,6 +202,20 @@
   }
   function sliceFrom(dates, eq, from) { const i = dates.findIndex(d => d >= from); if (i < 0) return null; return { dates: dates.slice(i), eq: eq.slice(i) }; }
 
-  root.Engine = { align, outerAlign, adjustSplits, metrics, drawdown, yearly, simulate, runRatio, ratioToday, robustness,
+  // ---------- data health: missing stretches > maxDays calendar days ----------
+  function gaps(s, from = '0000', maxDays = 10) {
+    const out = []; let total = 0;
+    for (let i = 1; i < s.dates.length; i++) {
+      if (s.dates[i] < from) continue;
+      const d = (new Date(s.dates[i]) - new Date(s.dates[i - 1])) / 864e5;
+      if (d > maxDays) { out.push({ from: s.dates[i - 1], to: s.dates[i], days: Math.round(d) }); total += d; }
+    }
+    return { list: out, totalDays: Math.round(total) };
+  }
+  function rowsPerYear(s, from = '0000') {
+    const m = {}; s.dates.forEach(d => { if (d >= from) { const y = d.slice(0, 4); m[y] = (m[y] || 0) + 1; } }); return m;
+  }
+
+  root.Engine = { gaps, rowsPerYear, align, outerAlign, adjustSplits, metrics, drawdown, yearly, simulate, runRatio, ratioToday, robustness,
     runMomentum, rankAt, buyHold, fixedMix, sliceFrom };
 })(typeof window !== 'undefined' ? window : globalThis);

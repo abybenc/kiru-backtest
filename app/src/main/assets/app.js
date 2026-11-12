@@ -12,6 +12,7 @@
     cost: 0.1, lookback: 20, topN: 3, cashRate: 6, startYear: 2008, splitYear: 2018,
     universe: 'NIFTYBEES,JUNIORBEES,BANKBEES,ITBEES,PHARMABEES,PSUBNKBEES,GOLDBEES,SILVERBEES,MON100,CPSEETF,MOM30IETF',
     keys: {},          // symbol -> Upstox instrument_key overrides
+    source: 'auto',    // auto | yahoo | upstox
   };
   let S = Object.assign({}, DEFAULTS, store.get('settings', {}));
   const charts = {};
@@ -36,58 +37,85 @@
     const cache = store.get('ikeys', {});
     const merged = Object.assign({}, cache, S.keys);
     const missing = symbols.filter(s => !merged[s]);
-    if (missing.length) {
+    if (missing.length && !store.get('ikeysTried_' + missing.join(','), false)) {
       status('First run: looking up ' + missing.length + ' ETF codes on Upstox (one time, ~20s)...');
-      const found = await nfind(missing);
-      Object.assign(cache, found); store.set('ikeys', cache); Object.assign(merged, found);
+      try {
+        const found = await nfind(missing);
+        Object.assign(cache, found); store.set('ikeys', cache); Object.assign(merged, found);
+      } catch (e) { console.log('upstox lookup failed', e); }
+      store.set('ikeysTried_' + missing.join(','), true);
     }
     return merged;
   }
   async function fetchCandles(key, from, to) {
-    // Upstox v3 historical candles; free data endpoint, no access token required. Max ~10 years per call.
+    // Upstox v3 historical candles; free data endpoint, no access token required. Fetched year by year to avoid silent truncation.
     const out = new Map();
-    let end = new Date(to);
-    const start = new Date(from);
-    while (end >= start) {
-      const s = new Date(Math.max(start, new Date(end.getFullYear() - 9, end.getMonth(), end.getDate())));
-      const url = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(key)}/days/1/${fmtD(end)}/${fmtD(s)}`;
-      const txt = await nget(url);
-      const j = JSON.parse(txt);
-      if (j.status !== 'success') throw new Error((j.errors && j.errors[0] && j.errors[0].message) || 'Upstox error');
-      (j.data.candles || []).forEach(c => out.set(String(c[0]).slice(0, 10), +c[4]));
-      end = new Date(s.getTime() - 864e5);
+    const y0 = +from.slice(0, 4), y1 = +to.slice(0, 4);
+    for (let y = y1; y >= y0; y--) {
+      const a = y === y0 ? from : `${y}-01-01`, b = y === y1 ? to : `${y}-12-31`;
+      const url = `https://api.upstox.com/v3/historical-candle/${encodeURIComponent(key)}/days/1/${b}/${a}`;
+      try {
+        const j = JSON.parse(await nget(url));
+        if (j.status === 'success') (j.data.candles || []).forEach(c => out.set(String(c[0]).slice(0, 10), +c[4]));
+      } catch (e) { if (y === y1) throw e; }
     }
     const dates = [...out.keys()].sort();
     return { dates, v: dates.map(d => out.get(d)) };
   }
+  async function fetchYahoo(sym, from, to) {
+    // Yahoo Finance daily chart; adjusted close (splits + dividends). No key needed.
+    const p1 = Math.floor(new Date(from).getTime() / 1000), p2 = Math.floor(new Date(to).getTime() / 1000) + 86400;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym + '.NS')}?period1=${p1}&period2=${p2}&interval=1d&events=split`;
+    const j = JSON.parse(await nget(url));
+    const r = j.chart && j.chart.result && j.chart.result[0];
+    if (!r || !r.timestamp) throw new Error('Yahoo: no data');
+    const adj = (r.indicators.adjclose && r.indicators.adjclose[0].adjclose) || r.indicators.quote[0].close;
+    const m = new Map();
+    r.timestamp.forEach((t, i) => { const v = adj[i]; if (v != null && isFinite(v) && v > 0) m.set(new Date((t + 19800) * 1000).toISOString().slice(0, 10), +v); });
+    const dates = [...m.keys()].sort();
+    return { dates, v: dates.map(d => m.get(d)) };
+  }
+  function mergeInto(old, fresh) {
+    const m = new Map(old.dates.map((d, k) => [d, old.v[k]])); fresh.dates.forEach((d, k) => m.set(d, fresh.v[k]));
+    const ds = [...m.keys()].sort(); return { dates: ds, v: ds.map(d => m.get(d)) };
+  }
+  async function getSource(src, sym, key, force, today) {
+    const ck = src + '_' + sym;
+    let c = store.get(ck, null);
+    const from = `${S.startYear - 1}-01-01`;
+    const pull = (a) => src === 'up' ? fetchCandles(key, a, today) : fetchYahoo(sym, a, today);
+    if (!c || force || (src === 'up' && c.key !== key) || c.from > from) {
+      const raw = await pull(from);
+      c = { key, from, dates: raw.dates, v: raw.v, at: today };
+    } else if (c.at !== today) {
+      const raw = await pull(c.dates[Math.max(0, c.dates.length - 10)]);
+      c = Object.assign(c, mergeInto(c, raw), { at: today });
+    }
+    c.v = c.v.map(x => Math.round(x * 1e4) / 1e4);
+    store.set(ck, c);
+    return c;
+  }
+  function quality(s) { if (!s || s.dates.length < 50) return -1e9; const g = E.gaps(s, `${S.startYear}-01-01`); return -g.totalDays * 10 + s.dates.length / 1000; }
   async function loadAll(force) {
     const syms = [...new Set(S.universe.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).concat(['NIFTYBEES', 'GOLDBEES']))];
-    const keys = await instrumentKeys(syms);
+    const mode = S.source || 'auto';
+    const keys = mode === 'yahoo' ? {} : await instrumentKeys(syms);
     const today = fmtD(new Date());
-    const data = {}; const problems = [];
+    const data = {}; const problems = []; const health = {};
     for (let i = 0; i < syms.length; i++) {
       const sym = syms[i];
-      if (!keys[sym]) { problems.push(sym + ': code not found'); continue; }
-      let c = store.get('px_' + sym, null);
-      try {
-        status(`Downloading prices ${i + 1}/${syms.length}: ${sym}`);
-        if (!c || force || c.key !== keys[sym]) {
-          const raw = await fetchCandles(keys[sym], `${S.startYear - 1}-01-01`, today);
-          c = { key: keys[sym], dates: raw.dates, v: raw.v, at: today };
-        } else if (c.at !== today) {
-          const from = c.dates[Math.max(0, c.dates.length - 10)];
-          const raw = await fetchCandles(keys[sym], from, today);
-          const m = new Map(c.dates.map((d, k) => [d, c.v[k]])); raw.dates.forEach((d, k) => m.set(d, raw.v[k]));
-          const ds = [...m.keys()].sort(); c = { key: c.key, dates: ds, v: ds.map(d => m.get(d)), at: today };
-        }
-        store.set('px_' + sym, c);
-      } catch (e) {
-        if (!c) { problems.push(sym + ': ' + e.message); continue; }
-        problems.push(sym + ': using saved data (' + e.message + ')');
-      }
-      const adj = E.adjustSplits({ dates: c.dates, v: c.v });
+      status(`Downloading prices ${i + 1}/${syms.length}: ${sym}`);
+      let up = null, yh = null, errs = [];
+      if (mode !== 'yahoo' && keys[sym]) { try { up = await getSource('up', sym, keys[sym], force, today); } catch (e) { errs.push('Upstox ' + e.message); up = store.get('up_' + sym, null); } }
+      if (mode !== 'upstox') { try { yh = await getSource('yh', sym, null, force, today); } catch (e) { errs.push('Yahoo ' + e.message); yh = store.get('yh_' + sym, null); } }
+      const pick = quality(yh) > quality(up) ? ['Yahoo', yh] : ['Upstox', up];
+      if (!pick[1] || pick[1].dates.length < 50) { problems.push(sym + ': no data (' + (errs.join('; ') || 'not found') + ')'); continue; }
+      const adj = E.adjustSplits({ dates: pick[1].dates, v: pick[1].v });
       data[sym] = adj;
+      const g = E.gaps(adj, `${S.startYear}-01-01`);
+      health[sym] = { src: pick[0], rows: adj.dates.length, first: adj.dates[0], last: adj.dates.at(-1), gaps: g, upGaps: up ? E.gaps(up, `${S.startYear}-01-01`).totalDays : null, yhGaps: yh ? E.gaps(yh, `${S.startYear}-01-01`).totalDays : null };
     }
+    window.__health = health;
     return { data, problems };
   }
 
@@ -128,7 +156,7 @@
     }
     const lastI = uniF.dates.length - 1;
     R = {
-      pairF, A, aD, aEq, benches, aM, aSplit,
+      pairF, A, aD, aEq, benches, aM, aSplit, pairGaps: E.gaps({ dates: pairF.dates }, from),
       yearlyA: E.yearly(aD, aEq), yearlyN: E.yearly(aD, benches['Niftybees buy & hold']), yearlyG: E.yearly(aD, benches['Goldbees buy & hold']),
       robust: E.robustness(pairF, [10, 15, 20, 30, 40, 50, 60], cost, from),
       today: E.ratioToday(pairF, S.lookback),
@@ -221,6 +249,7 @@
       <div class="card"><h3>Kiru's rule</h3><div class="note" style="font-size:13px;color:var(--fg)">Ratio = Niftybees ÷ Goldbees. Close above prior ${S.lookback}-day high → 100% Niftybees. Close below prior ${S.lookback}-day low → 100% Goldbees. Otherwise hold. Trade next day's close. Cost ${S.cost}% per side.</div>
         <div class="note">Kiru's thread (16 May 2026) claims 18.0% CAGR and −24.95% max drawdown, Jan 2008 to May 2026. Compare below.</div></div>
       ${EXPLAIN}
+      ${R.pairGaps.list.length ? `<div class="card" style="border-color:var(--bad)"><h3 class="neg">Data gap warning</h3><div class="note" style="color:var(--fg)">Missing prices: ${R.pairGaps.list.map(g => `${g.from} → ${g.to} (${g.days} days)`).join(', ')}. Results across these stretches are not reliable. Try Settings → Price data source → Auto, then Re-download.</div></div>` : ''}
       <div class="card"><h3>Results ${R.aD[0]} → ${R.aD.at(-1)}</h3>${metricsTable(k.map(n => [n, m[n]]))}
         <div class="note">₹1L → means ₹1,00,000 invested at the start grew to this. Example: 18% CAGR for 18 years turns ₹1L into about ₹19.7L.</div></div>
       <div class="card"><h3>Growth of ₹1L (log scale)</h3><div class="chart"><canvas id="c-a"></canvas></div></div>
@@ -295,6 +324,11 @@
     $('#p-reset').onclick = () => { if (window.confirm('Reset paper trading?')) { store.del('paper'); renderPaper(); } };
   }
 
+  function healthTable() {
+    const h = window.__health || {};
+    const rows = Object.entries(h).map(([s, x]) => `<tr><td>${s}</td><td style="text-align:left">${x.src}</td><td>${x.first.slice(0, 4)}</td><td>${x.rows}</td><td class="${x.gaps.totalDays ? 'neg' : 'pos'}">${x.gaps.totalDays}</td><td>${x.upGaps ?? '–'}/${x.yhGaps ?? '–'}</td></tr>`).join('');
+    return rows ? `<div class="scroll"><table><tr><th>ETF</th><th style="text-align:left">Used</th><th>From</th><th>Days</th><th>Gap days</th><th>Upstox/Yahoo</th></tr>${rows}</table></div>` : '<div class="note">Load data first.</div>';
+  }
   function renderSettings() {
     const keys = Object.assign({}, store.get('ikeys', {}), S.keys);
     $('#tab-settings').innerHTML = `<div class="card"><h3>Backtest settings</h3>
@@ -304,16 +338,22 @@
       <label>Cash return (% per year) for empty momentum slots</label><input id="s-cash" type="number" step="0.5" value="${S.cashRate}">
       <label>Backtest start year</label><input id="s-start" type="number" value="${S.startYear}">
       <label>Out-of-sample split year</label><input id="s-split" type="number" value="${S.splitYear}">
+      <label>Price data source</label><select id="s-src" style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit">
+        <option value="auto"${S.source === 'auto' ? ' selected' : ''}>Auto: best of Yahoo and Upstox (recommended)</option>
+        <option value="yahoo"${S.source === 'yahoo' ? ' selected' : ''}>Yahoo Finance only</option>
+        <option value="upstox"${S.source === 'upstox' ? ' selected' : ''}>Upstox only</option></select>
       <label>Momentum ETF universe (NSE symbols, comma separated)</label><textarea id="s-uni">${S.universe}</textarea>
       <div class="row" style="margin-top:12px"><button class="btn" id="s-save">Save & re-run</button><button class="btn ghost" id="s-def">Defaults</button></div></div>
-      <div class="card"><h3>Data</h3><div class="note">Prices: Upstox historical candles (free, no login). Splits are detected and adjusted automatically.</div>
+      <div class="card"><h3>Data health</h3>${healthTable()}
+        <div class="note">Gap days = calendar days with no prices beyond normal holidays (any stretch over 10 days). Should be 0. Example: a missing 2011 to 2014 stretch shows about 1,400 gap days.</div></div>
+      <div class="card"><h3>Data</h3><div class="note">Prices: Yahoo Finance and Upstox historical candles (both free, no login). In Auto mode each ETF uses the source with fewer holes. Splits are detected and adjusted automatically.</div>
         <div class="note">${(R && R.splits.length) ? R.splits.join('<br>') : 'No splits detected.'}</div>
         <details><summary>Upstox instrument codes</summary><div class="note">${Object.entries(keys).map(([s, k]) => `${s}: ${k}`).join('<br>') || 'none yet'}</div></details>
         <div class="row" style="margin-top:10px"><button class="btn ghost" id="s-redl">Re-download all prices</button><button class="btn ghost" id="s-clear">Clear codes cache</button></div></div>
       <div class="card note">Not investment advice. Backtests show what a rule did in the past, not what it will do.</div>`;
     $('#s-save').onclick = () => {
       S = Object.assign(S, { cost: +$('#s-cost').value, lookback: Math.max(2, +$('#s-lb').value | 0), topN: Math.max(1, +$('#s-top').value | 0), cashRate: +$('#s-cash').value,
-        startYear: +$('#s-start').value | 0, splitYear: +$('#s-split').value | 0, universe: $('#s-uni').value.replace(/\s+/g, '') });
+        startYear: +$('#s-start').value | 0, source: $('#s-src').value, splitYear: +$('#s-split').value | 0, universe: $('#s-uni').value.replace(/\s+/g, '') });
       store.set('settings', S); boot(false);
     };
     $('#s-def').onclick = () => { S = Object.assign({}, DEFAULTS); store.set('settings', S); boot(false); };
@@ -348,6 +388,7 @@
     window.scrollTo(0, 0);
   });
   $('#refresh').onclick = () => boot(false);
+  try { Object.keys(localStorage).filter(k => k.startsWith('px_')).forEach(k => localStorage.removeItem(k)); } catch (e) { }
   window.__boot = boot;
   boot(false);
 })();
