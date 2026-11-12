@@ -28,20 +28,59 @@
   const r2 = x => (x == null || !isFinite(x)) ? null : Math.round(x * 100) / 100;
 
   // ---------- split detection (broker candles are often unadjusted) ----------
+  // ---------- data cleaning: bad ticks, mis-scaled stretches, splits ----------
+  // No ETF moves 40%+ in one day; any such jump is a data artefact.
   function adjustSplits(s) {
-    const v = s.v.slice(); const events = [];
+    let dates = s.dates.slice(), v = s.v.slice(); const events = [];
     const factors = [2, 4, 5, 10, 20, 25, 50, 100];
+    const near = r => { const x = r >= 1 ? r : 1 / r; const f = factors.reduce((b, f) => Math.abs(Math.log(x / f)) < Math.abs(Math.log(x / b)) ? f : b, 2); return Math.abs(x / f - 1) < 0.15 ? (r >= 1 ? f : 1 / f) : null; };
+    // pass 1: big jumps (outside 0.6x..1.6x)
+    const span = i => (new Date(dates[i]) - new Date(dates[i - 1])) / 864e5;
     for (let i = 1; i < v.length; i++) {
-      const r = v[i - 1] / v[i];
-      if (r > 1.8) {
-        const f = factors.reduce((b, f) => Math.abs(Math.log(r / f)) < Math.abs(Math.log(r / b)) ? f : b, factors[0]);
-        if (Math.abs(r / f - 1) < 0.12) {
-          for (let j = 0; j < i; j++) v[j] /= f;
-          events.push({ date: s.dates[i], factor: f });
-        }
+      const r = v[i] / v[i - 1];
+      if ((r > 0.6 && r < 1.6) || span(i) > 10) continue;   // a move across a data hole is real, not an error
+      let j = -1;   // reverse jump within 15 rows -> the stretch i..j-1 is on the wrong scale
+      for (let k = i + 1; k < Math.min(v.length, i + 16); k++) { const q = v[k] / v[k - 1]; if (Math.abs(Math.log(q * r)) < 0.2) { j = k; break; } }
+      if (j > 0) {
+        for (let k = i; k < j; k++) v[k] /= r;
+        events.push({ date: dates[i], type: 'bad prices fixed', factor: +r.toFixed(3), days: j - i });
+      } else {
+        const f = near(r) || r;   // persistent: split (or a source switch); rescale history before it
+        for (let k = 0; k < i; k++) v[k] *= f;
+        events.push({ date: dates[i], type: near(r) ? 'split' : 'level shift', factor: f >= 1 ? +f.toFixed(3) : '1:' + Math.round(1 / f) });
       }
     }
-    return { dates: s.dates, v, events };
+    // pass 2: single-day spikes of 20%+ that revert next day
+    const keep = v.map(() => true);
+    for (let i = 1; i < v.length - 1; i++) {
+      const a = v[i] / v[i - 1], c = v[i + 1] / v[i - 1];
+      if ((a > 1.2 || a < 0.83) && c > 0.92 && c < 1.08 && span(i) <= 10 && span(i + 1) <= 10) { keep[i] = false; events.push({ date: dates[i], type: 'bad tick removed', factor: +a.toFixed(3) }); }
+    }
+    dates = dates.filter((_, i) => keep[i]); v = v.filter((_, i) => keep[i]);
+    return { dates, v, events };
+  }
+  // Fill holes (and earlier history) in `base` from `other`, scaled to match at the join.
+  function spliceFill(base, other, maxGap = 10) {
+    if (!other || other.dates.length < 2) return { dates: base.dates, v: base.v, filled: 0 };
+    const om = new Map(other.dates.map((d, i) => [d, other.v[i]]));
+    const bm = new Map(base.dates.map((d, i) => [d, base.v[i]]));
+    let filled = 0;
+    const scaleAt = d => { const o = om.get(d), b = bm.get(d); return (o && b) ? b / o : null; };
+    // earlier history
+    const first = base.dates[0]; const sc0 = scaleAt(first);
+    if (sc0) other.dates.forEach((d, i) => { if (d < first) { bm.set(d, other.v[i] * sc0); filled++; } });
+    // interior gaps
+    for (let i = 1; i < base.dates.length; i++) {
+      const a = base.dates[i - 1], z = base.dates[i];
+      if ((new Date(z) - new Date(a)) / 864e5 <= maxGap) continue;
+      const sc = scaleAt(a); if (!sc) continue;
+      other.dates.forEach((d, k) => { if (d > a && d < z) { bm.set(d, other.v[k] * sc); filled++; } });
+    }
+    const dates = [...bm.keys()].sort();
+    return { dates, v: dates.map(d => bm.get(d)), filled };
+  }
+  function bigMoves(s, from = '0000', thr = 0.15) {
+    const out = []; for (let i = 1; i < s.dates.length; i++) { if (s.dates[i] < from || (new Date(s.dates[i]) - new Date(s.dates[i - 1])) / 864e5 > 10) continue; const r = s.v[i] / s.v[i - 1] - 1; if (Math.abs(r) > thr) out.push(`${s.dates[i]} ${(r * 100).toFixed(1)}%`); } return out;
   }
 
   // ---------- metrics ----------
@@ -216,6 +255,6 @@
     const m = {}; s.dates.forEach(d => { if (d >= from) { const y = d.slice(0, 4); m[y] = (m[y] || 0) + 1; } }); return m;
   }
 
-  root.Engine = { gaps, rowsPerYear, align, outerAlign, adjustSplits, metrics, drawdown, yearly, simulate, runRatio, ratioToday, robustness,
+  root.Engine = { gaps, rowsPerYear, spliceFill, bigMoves, align, outerAlign, adjustSplits, metrics, drawdown, yearly, simulate, runRatio, ratioToday, robustness,
     runMomentum, rankAt, buyHold, fixedMix, sliceFrom };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -108,12 +108,19 @@
       let up = null, yh = null, errs = [];
       if (mode !== 'yahoo' && keys[sym]) { try { up = await getSource('up', sym, keys[sym], force, today); } catch (e) { errs.push('Upstox ' + e.message); up = store.get('up_' + sym, null); } }
       if (mode !== 'upstox') { try { yh = await getSource('yh', sym, null, force, today); } catch (e) { errs.push('Yahoo ' + e.message); yh = store.get('yh_' + sym, null); } }
-      const pick = quality(yh) > quality(up) ? ['Yahoo', yh] : ['Upstox', up];
-      if (!pick[1] || pick[1].dates.length < 50) { problems.push(sym + ': no data (' + (errs.join('; ') || 'not found') + ')'); continue; }
-      const adj = E.adjustSplits({ dates: pick[1].dates, v: pick[1].v });
+      const cu = up && up.dates.length > 50 ? E.adjustSplits(up) : null;
+      const cy = yh && yh.dates.length > 50 ? E.adjustSplits(yh) : null;
+      if (!cu && !cy) { problems.push(sym + ': no data (' + (errs.join('; ') || 'not found') + ')'); continue; }
+      const upFirst = !cy || (cu && quality(cu) >= quality(cy));
+      const base = upFirst ? cu : cy, other = upFirst ? cy : cu;
+      const sp = E.spliceFill(base, other);
+      const adj = E.adjustSplits(sp);            // re-check joins
       data[sym] = adj;
       const g = E.gaps(adj, `${S.startYear}-01-01`);
-      health[sym] = { src: pick[0], rows: adj.dates.length, first: adj.dates[0], last: adj.dates.at(-1), gaps: g, upGaps: up ? E.gaps(up, `${S.startYear}-01-01`).totalDays : null, yhGaps: yh ? E.gaps(yh, `${S.startYear}-01-01`).totalDays : null };
+      health[sym] = { src: (upFirst ? 'Upstox' : 'Yahoo') + (sp.filled ? ` +${sp.filled}d ${upFirst ? 'Yahoo' : 'Upstox'}` : ''), rows: adj.dates.length, first: adj.dates[0], last: adj.dates.at(-1), gaps: g,
+        upGaps: up ? E.gaps(up, `${S.startYear}-01-01`).totalDays : null, yhGaps: yh ? E.gaps(yh, `${S.startYear}-01-01`).totalDays : null,
+        fixes: [...(base.events || []), ...(adj.events || [])].map(e => `${e.date} ${e.type} ${e.factor}${e.days ? ' (' + e.days + 'd)' : ''}`),
+        big: E.bigMoves(adj, `${S.startYear}-01-01`) };
     }
     window.__health = health;
     return { data, problems };
@@ -161,7 +168,7 @@
       robust: E.robustness(pairF, [10, 15, 20, 30, 40, 50, 60], cost, from),
       today: E.ratioToday(pairF, S.lookback),
       uniF, B, bD, bEq, bM, nbM, bNb, rankNow: E.rankAt(uniF, lastI),
-      splits: Object.entries(data).flatMap(([s, d]) => d.events.map(e => `${s}: 1:${e.factor} split on ${e.date} (auto-adjusted)`)),
+      splits: Object.entries(window.__health || {}).flatMap(([s, h]) => h.fixes.map(f => `${s}: ${f}`)),
     };
     R.bHolding = R.B ? Object.entries(R.B.w[R.B.w.length - 1]).filter(([, w]) => w > 0).map(([c]) => c) : [];
   }
@@ -326,8 +333,8 @@
 
   function healthTable() {
     const h = window.__health || {};
-    const rows = Object.entries(h).map(([s, x]) => `<tr><td>${s}</td><td style="text-align:left">${x.src}</td><td>${x.first.slice(0, 4)}</td><td>${x.rows}</td><td class="${x.gaps.totalDays ? 'neg' : 'pos'}">${x.gaps.totalDays}</td><td>${x.upGaps ?? '–'}/${x.yhGaps ?? '–'}</td></tr>`).join('');
-    return rows ? `<div class="scroll"><table><tr><th>ETF</th><th style="text-align:left">Used</th><th>From</th><th>Days</th><th>Gap days</th><th>Upstox/Yahoo</th></tr>${rows}</table></div>` : '<div class="note">Load data first.</div>';
+    const rows = Object.entries(h).map(([s, x]) => `<tr><td>${s}</td><td style="text-align:left">${x.src}</td><td>${x.first.slice(0, 4)}</td><td>${x.rows}</td><td class="${x.gaps.totalDays ? 'neg' : 'pos'}">${x.gaps.totalDays}</td><td>${x.upGaps ?? '–'}/${x.yhGaps ?? '–'}</td><td class="${x.big.length ? 'neg' : 'pos'}">${x.big.length}</td></tr>`).join('');
+    return rows ? `<div class="scroll"><table><tr><th>ETF</th><th style="text-align:left">Used</th><th>From</th><th>Days</th><th>Gap days</th><th>Upstox/Yahoo</th><th>Jumps</th></tr>${rows}</table></div>` : '<div class="note">Load data first.</div>';
   }
   function renderSettings() {
     const keys = Object.assign({}, store.get('ikeys', {}), S.keys);
@@ -345,9 +352,9 @@
       <label>Momentum ETF universe (NSE symbols, comma separated)</label><textarea id="s-uni">${S.universe}</textarea>
       <div class="row" style="margin-top:12px"><button class="btn" id="s-save">Save & re-run</button><button class="btn ghost" id="s-def">Defaults</button></div></div>
       <div class="card"><h3>Data health</h3>${healthTable()}
-        <div class="note">Gap days = calendar days with no prices beyond normal holidays (any stretch over 10 days). Should be 0. Example: a missing 2011 to 2014 stretch shows about 1,400 gap days.</div></div>
+        <div class="note">Gap days = calendar days with no prices beyond normal holidays (any stretch over 10 days). Should be 0. Example: a missing 2011 to 2014 stretch shows about 1,400 gap days. Jumps = days moving over 15%, should be 0 for ETFs (except rare crashes like Mar 2020).</div></div>
       <div class="card"><h3>Data</h3><div class="note">Prices: Yahoo Finance and Upstox historical candles (both free, no login). In Auto mode each ETF uses the source with fewer holes. Splits are detected and adjusted automatically.</div>
-        <div class="note">${(R && R.splits.length) ? R.splits.join('<br>') : 'No splits detected.'}</div>
+        <div class="note">${(R && R.splits.length) ? R.splits.join('<br>') : 'No data fixes needed.'}</div>
         <details><summary>Upstox instrument codes</summary><div class="note">${Object.entries(keys).map(([s, k]) => `${s}: ${k}`).join('<br>') || 'none yet'}</div></details>
         <div class="row" style="margin-top:10px"><button class="btn ghost" id="s-redl">Re-download all prices</button><button class="btn ghost" id="s-clear">Clear codes cache</button></div></div>
       <div class="card note">Not investment advice. Backtests show what a rule did in the past, not what it will do.</div>`;
@@ -371,7 +378,8 @@
     L.push(`Settings: cost ${S.cost}%/side, lookback ${S.lookback}d, momentum topN ${S.topN}, cash ${S.cashRate}%, start ${S.startYear}, split ${S.splitYear}, source ${S.source || 'auto'}`);
     L.push('\n## DATA HEALTH (gap days should be 0)');
     Object.entries(window.__health || {}).forEach(([k, h]) => L.push(`${k}: src ${h.src}, from ${h.first}, rows ${h.rows}, gapDays ${h.gaps.totalDays}${h.gaps.list.length ? ' [' + h.gaps.list.map(g => g.from + '->' + g.to).join('; ') + ']' : ''}, upstoxGaps ${h.upGaps ?? '-'}, yahooGaps ${h.yhGaps ?? '-'}`));
-    if (R.splits.length) L.push('Splits adjusted: ' + R.splits.join('; '));
+    if (R.splits.length) L.push('Data fixes applied: ' + R.splits.join('; '));
+    Object.entries(window.__health || {}).forEach(([k, h]) => { if (h.big.length) L.push(`${k} daily moves >15% (check!): ${h.big.slice(0, 8).join(', ')}`); });
     L.push(`Pair (NIFTYBEES/GOLDBEES) gaps after start: ${R.pairGaps.list.length ? R.pairGaps.list.map(g => `${g.from}->${g.to} (${g.days}d)`).join(', ') : 'none'}`);
     L.push(`\n## STRATEGY A: Nifty/Gold ratio switch (Kiru claims 18.0% CAGR, -24.95% MaxDD, Jan 2008-May 2026), ${R.aD[0]} -> ${R.aD.at(-1)}`);
     Object.entries(R.aM).forEach(([n, m]) => L.push(m2(n, m)));
@@ -438,7 +446,10 @@ REPORT:
     let lastErr, fellBack = '';
     for (const m of models) {
       try {
-        const txt = await npost(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, body, 'x-goog-api-key', key);
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`;
+        let txt;
+        try { txt = await npost(url, body, 'x-goog-api-key', key); }
+        catch (e1) { if (!/UnknownHost|resolve|timeout|Connect|Socket/i.test(e1.message)) throw e1; await new Promise(r => setTimeout(r, 2000)); txt = await npost(url, body, 'x-goog-api-key', key); }
         const j = JSON.parse(txt);
         const out = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
         if (!out) throw new Error('Empty answer (' + (j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || 'unknown') + ')');
@@ -486,7 +497,7 @@ REPORT:
         const r = await geminiReview(buildReport());
         const rec = { text: r.text, model: r.model, note: r.note, at: new Date().toLocaleString('en-IN'), data: R.today.date };
         store.set('lastReview', rec); renderReview();
-      } catch (e) { out.innerHTML = `<div class="note neg">Review failed: ${e.message.replace(/</g, '&lt;')}</div><div class="note">Check the key, or pick Gemini 3.6 Flash.</div>`; }
+      } catch (e) { const net = /UnknownHost|Unable to resolve|timeout|ConnectException|SocketException/i.test(e.message); out.innerHTML = `<div class="note neg">Review failed: ${e.message.replace(/</g, '&lt;')}</div><div class="note">${net ? 'Network problem, not your key. Check internet, VPN or Private DNS, then try again.' : 'Check the key, or pick Gemini 3.6 Flash.'}</div>`; }
     };
   }
   function renderAll() { renderToday(); renderA(); renderB(); renderPaper(); renderReview(); renderSettings(); $('#asof').textContent = 'data ' + R.today.date; }
