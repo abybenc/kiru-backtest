@@ -1,0 +1,27 @@
+plugins { id 'com.android.application' }
+
+def runNo = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as int
+
+android {
+    namespace 'com.aby.kirubacktest'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.aby.kirubacktest'
+        minSdk 26
+        targetSdk 35
+        versionCode runNo          // always increases, so each new APK installs as an update
+        versionName "1.0.${runNo}"
+    }
+    signingConfigs {
+        release {                  // same key every build -> updates install over the old app
+            storeFile file('../release.jks')
+            storePassword 'kiruapp123'
+            keyAlias 'kiru'
+            keyPassword 'kiruapp123'
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.release }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+}

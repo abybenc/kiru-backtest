@@ -1,0 +1,7 @@
+release.jks
+build/
+.gradle/
+app/build/
+app/src/main/assets/chart.umd.js
+package/
+*.tgz
