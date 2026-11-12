@@ -1,6 +1,10 @@
 package com.aby.kirubacktest;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.widget.Toast;
 import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
@@ -19,6 +23,8 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Arrays;
@@ -119,6 +125,47 @@ public class MainActivity extends Activity {
                     if (out.length() > 0) reply(id, true, out.toString());
                     else reply(id, false, "Instrument lookup failed: " + e.getMessage());
                 }
+            });
+        }
+
+        @JavascriptInterface
+        public void post(final String id, final String url, final String body, final String headerName, final String headerValue) {
+            pool.execute(() -> {
+                try {
+                    HttpURLConnection c = open(url);
+                    c.setReadTimeout(180000);
+                    c.setRequestMethod("POST");
+                    c.setDoOutput(true);
+                    c.setRequestProperty("Content-Type", "application/json");
+                    if (headerName != null && headerName.length() > 0) c.setRequestProperty(headerName, headerValue);
+                    try (OutputStream os = c.getOutputStream()) { os.write(body.getBytes(StandardCharsets.UTF_8)); }
+                    int code = c.getResponseCode();
+                    InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                    String resp = in == null ? "" : readAll(in);
+                    if (code >= 400) reply(id, false, "HTTP " + code + " " + resp.substring(0, Math.min(400, resp.length())));
+                    else reply(id, true, resp);
+                } catch (Exception e) {
+                    reply(id, false, e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void copy(final String text) {
+            runOnUiThread(() -> {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(ClipData.newPlainText("Kiru report", text));
+                Toast.makeText(MainActivity.this, "Report copied. Paste it in Claude.", Toast.LENGTH_SHORT).show();
+            });
+        }
+
+        @JavascriptInterface
+        public void share(final String text) {
+            runOnUiThread(() -> {
+                Intent i = new Intent(Intent.ACTION_SEND);
+                i.setType("text/plain");
+                i.putExtra(Intent.EXTRA_TEXT, text);
+                try { startActivity(Intent.createChooser(i, "Send report to")); } catch (Exception ignored) { }
             });
         }
 

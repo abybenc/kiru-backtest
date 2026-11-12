@@ -361,7 +361,135 @@
     $('#s-clear').onclick = () => { store.del('ikeys'); boot(true); };
   }
 
-  function renderAll() { renderToday(); renderA(); renderB(); renderPaper(); renderSettings(); $('#asof').textContent = 'data ' + R.today.date; }
+
+  // ---------------- report + AI review ----------------
+  function buildReport() {
+    if (!R) return 'No data loaded yet.';
+    const L = [];
+    const m2 = (n, m) => m ? `${n}: CAGR ${m.cagr}%, MaxDD ${m.mdd}%, Sharpe ${m.sharpe}, Vol ${m.vol}%, Rs1L->${Math.round(m.finalX * 100000)}, longest underwater ${m.underwaterDays} days` : `${n}: n/a`;
+    L.push(`KIRU BACKTEST REPORT | app data as of ${R.today.date} | generated ${new Date().toISOString().slice(0, 16)}`);
+    L.push(`Settings: cost ${S.cost}%/side, lookback ${S.lookback}d, momentum topN ${S.topN}, cash ${S.cashRate}%, start ${S.startYear}, split ${S.splitYear}, source ${S.source || 'auto'}`);
+    L.push('\n## DATA HEALTH (gap days should be 0)');
+    Object.entries(window.__health || {}).forEach(([k, h]) => L.push(`${k}: src ${h.src}, from ${h.first}, rows ${h.rows}, gapDays ${h.gaps.totalDays}${h.gaps.list.length ? ' [' + h.gaps.list.map(g => g.from + '->' + g.to).join('; ') + ']' : ''}, upstoxGaps ${h.upGaps ?? '-'}, yahooGaps ${h.yhGaps ?? '-'}`));
+    if (R.splits.length) L.push('Splits adjusted: ' + R.splits.join('; '));
+    L.push(`Pair (NIFTYBEES/GOLDBEES) gaps after start: ${R.pairGaps.list.length ? R.pairGaps.list.map(g => `${g.from}->${g.to} (${g.days}d)`).join(', ') : 'none'}`);
+    L.push(`\n## STRATEGY A: Nifty/Gold ratio switch (Kiru claims 18.0% CAGR, -24.95% MaxDD, Jan 2008-May 2026), ${R.aD[0]} -> ${R.aD.at(-1)}`);
+    Object.entries(R.aM).forEach(([n, m]) => L.push(m2(n, m)));
+    L.push(m2(`Before ${S.splitYear}`, R.aSplit.in)); L.push(m2(`From ${S.splitYear}`, R.aSplit.out));
+    L.push('Robustness (lookback: CAGR / MaxDD / Sharpe / switches): ' + R.robust.map(r => `${r.lookback}d: ${r.cagr}/${r.mdd}/${r.sharpe}/${r.switches}`).join(' | '));
+    const sw = {}; R.A.trades.forEach(t => { const y = t.date.slice(0, 4); sw[y] = (sw[y] || 0) + 1; });
+    L.push('Year: switch% / nifty% / gold% / #switches');
+    R.yearlyA.forEach((y, i) => L.push(`${y.year}: ${y.ret} / ${R.yearlyN[i]?.ret} / ${R.yearlyG[i]?.ret} / ${sw[y.year] || 0}`));
+    const ddA = E.drawdown(R.aEq); let wi = 0; ddA.forEach((d, i) => { if (d < ddA[wi]) wi = i; });
+    L.push(`Worst drawdown trough date: ${R.aD[wi]}`);
+    L.push('Last 15 switches: ' + R.A.trades.slice(-15).map(t => `${t.date} ${t.holding}`).join(', '));
+    const t = R.today;
+    L.push(`TODAY: holding ${t.holding}, ratio ${t.ratio.toFixed(4)}, 20d high ${t.hi.toFixed(4)}, 20d low ${t.lo.toFixed(4)}, signal fired today: ${t.fired || 'none'}, last switch ${t.lastSwitch}`);
+    if (R.B) {
+      L.push(`\n## STRATEGY B: smooth momentum rotation, ${R.bD[0]} -> ${R.bD.at(-1)}`);
+      L.push(m2('Momentum', R.bM)); L.push(m2('Niftybees B&H same period', R.nbM));
+      L.push('Yearly momentum %: ' + E.yearly(R.bD, R.bEq).map(y => `${y.year}:${y.ret}`).join(' '));
+      L.push('Last 6 picks: ' + R.B.picks.slice(-6).map(p => `${p.date} ${p.picks}`).join(' | '));
+      L.push('Ranking now: ' + R.rankNow.map(r => `${r.etf} ${r.score ?? '-'}${r.aboveSma ? '' : '(below200)'}`).join(', '));
+    }
+    const P = store.get('paper', null);
+    if (P) {
+      const run = paperRun(P.start, P.capital);
+      const f = (n, rows) => rows && rows.length ? `${n}: ${rows.length} days, value ${Math.round(rows.at(-1).value)} (${((rows.at(-1).value / P.capital - 1) * 100).toFixed(2)}%), holding ${rows.at(-1).hold}` : `${n}: not started yet`;
+      L.push(`\n## PAPER TRADING since ${P.start}, capital ${P.capital}`); L.push(f('A', run.A)); L.push(f('B', run.B));
+    } else L.push('\n## PAPER TRADING: not started');
+    return L.join('\n');
+  }
+
+  const REVIEW_PROMPT = `You are a strict systematic-trading reviewer in the style of Kirubakaran Rajendran (Kiru): rule-based, data-first, survival-first ("In God we trust, all others must bring data"). Review the backtest report below for an Indian ETF trader who lives in Boston and will place orders manually.
+Write in simple, warm Indian English. Never use em dashes. Be candid; do not hype. Whenever you use jargon (CAGR, drawdown, Sharpe, whipsaw, curve fitting), add a one-line example with real rupee numbers.
+Use exactly these sections with markdown headings:
+## Verdict
+One line: Trust / Trust with caution / Do not trust yet, and why.
+## Data check
+Any gaps, splits, short history, or source problems. If data is broken, say results cannot be trusted and stop the deep analysis.
+## Kiru claim vs this backtest
+Compare against 18.0% CAGR and -24.95% max drawdown.
+## Green flags
+## Red flags
+Check: robustness across lookbacks (curve fitting), before vs after split, edge over plain Goldbees and 50/50 (is the extra return worth it), whipsaw years (many switches, small return), worst drawdown and how long underwater, cost sensitivity.
+## Position sizing
+Using Kiru's rule (size so the worst historical drawdown costs no more than 15-20% of total capital), say how much of a portfolio could go into this, with a rupee example on Rs 10,00,000.
+## Momentum strategy
+Short verdict on Strategy B vs Niftybees.
+## What to do today
+Based on TODAY line: hold or switch, in one line.
+## Next 3 experiments
+Concrete settings changes to test in the app (e.g. cost 0.2%, start year 2012), each with what result would worry you.
+Keep it under 500 words.
+
+REPORT:
+`;
+
+  function npost(url, body, hn, hv) {
+    if (window.Native && window.Native.post) return new Promise((res, rej) => { const id = 'p' + (++cbId); pending[id] = { res, rej }; window.Native.post(id, url, body, hn || '', hv || ''); });
+    return fetch(url, { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, hn ? { [hn]: hv } : {}), body }).then(async r => { const t = await r.text(); if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + t.slice(0, 300)); return t; });
+  }
+  async function geminiReview(report) {
+    const key = store.get('geminiKey', '');
+    if (!key) throw new Error('Add your Gemini API key first');
+    const models = [...new Set([store.get('geminiModel', 'gemini-4-carbon'), 'gemini-4-carbon', 'gemini-3.6-flash', 'gemini-flash-latest', 'gemini-2.5-flash'].filter(Boolean))];
+    const body = JSON.stringify({ contents: [{ role: 'user', parts: [{ text: REVIEW_PROMPT + report }] }], generationConfig: { temperature: 0.3, maxOutputTokens: 16384 } });
+    let lastErr, fellBack = '';
+    for (const m of models) {
+      try {
+        const txt = await npost(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, body, 'x-goog-api-key', key);
+        const j = JSON.parse(txt);
+        const out = (j.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+        if (!out) throw new Error('Empty answer (' + (j.candidates?.[0]?.finishReason || j.promptFeedback?.blockReason || 'unknown') + ')');
+        return { text: out, model: m, note: fellBack };
+      } catch (e) {
+        lastErr = e;
+        const paidOnly = /carbon/.test(m) && /HTTP 40[03]|HTTP 429|permission|billing|paid|quota|not available/i.test(e.message);
+        if (paidOnly) { fellBack = 'Gemini 4 Carbon needs a paid key, so this review used a free model.'; continue; }
+        if (!/HTTP 404|not found|not supported/i.test(e.message)) throw e;   // only fall through on unknown model
+      }
+    }
+    throw lastErr;
+  }
+  function md(t) {
+    const esc = x => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    return esc(t).split('\n').map(l => {
+      l = l.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+      if (/^###? /.test(l)) return `<h3 style="margin:14px 0 6px">${l.replace(/^#+ /, '')}</h3>`;
+      if (/^\s*[-*] /.test(l)) return `<div style="padding-left:14px;text-indent:-10px">• ${l.replace(/^\s*[-*] /, '')}</div>`;
+      return l.trim() ? `<div style="margin:4px 0">${l}</div>` : '';
+    }).join('');
+  }
+  function renderReview() {
+    const last = store.get('lastReview', null), key = store.get('geminiKey', '');
+    $('#tab-review').innerHTML = `
+      <div class="card"><h3>✦ AI review</h3><div class="note" style="color:var(--fg)">One tap sends every result in the app (all tabs, data health, switches, paper trades) to Gemini with a Kiru-style checklist: data check, claim vs reality, curve fitting, edge over gold, whipsaw, position sizing and today's action.</div>
+        <div class="row" style="margin-top:10px"><button class="btn" id="r-run">Run AI review</button></div>
+        <div id="r-out" style="margin-top:10px">${last ? `<div class="note">Last review: ${last.at} · ${last.model} · data ${last.data}</div>${last.note ? `<div class="note" style="color:var(--gold)">${last.note}</div>` : ''}${md(last.text)}` : '<div class="note">No review yet.</div>'}</div></div>
+      <div class="card"><h3>Send to Claude instead</h3><div class="note">Copies the full report as text. Paste it in your Claude chat, no screenshots needed.</div>
+        <div class="row" style="margin-top:8px"><button class="btn ghost" id="r-copy">Copy report</button><button class="btn ghost" id="r-share">Share…</button><button class="btn ghost" id="r-view">View report</button></div>
+        <pre id="r-rep" class="hidden" style="white-space:pre-wrap;font-size:11px;color:var(--muted)"></pre></div>
+      <div class="card"><h3>Gemini key</h3><div class="note">Free key from aistudio.google.com → Get API key. Stored only on this phone.</div>
+        <label>API key</label><input id="r-key" type="password" value="${key ? '••••••••' + key.slice(-4) : ''}" placeholder="AIza...">
+        <label>Model</label><select id="r-model" style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px;font:inherit">
+          ${[['gemini-4-carbon', 'Gemini 4 Carbon: deepest, paid key (~₹4 to ₹8 per review)'], ['gemini-3.6-flash', 'Gemini 3.6 Flash: fast, free tier']].map(([v, l]) => `<option value="${v}"${store.get('geminiModel', 'gemini-4-carbon') === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
+        <div class="note">If Carbon is refused (free key), the app falls back to Flash automatically.</div>
+        <div class="row" style="margin-top:10px"><button class="btn ghost" id="r-save">Save key</button></div></div>`;
+    $('#r-save').onclick = () => { const v = $('#r-key').value.trim(); if (v && !v.startsWith('••')) store.set('geminiKey', v); store.set('geminiModel', $('#r-model').value || 'gemini-4-carbon'); status('Gemini key saved'); setTimeout(() => status(''), 1500); renderReview(); };
+    $('#r-copy').onclick = () => { const t = buildReport(); if (window.Native && window.Native.copy) window.Native.copy(t); else navigator.clipboard && navigator.clipboard.writeText(t); };
+    $('#r-share').onclick = () => { const t = buildReport(); if (window.Native && window.Native.share) window.Native.share(t); };
+    $('#r-view').onclick = () => { const el = $('#r-rep'); el.textContent = buildReport(); el.classList.toggle('hidden'); };
+    $('#r-run').onclick = async () => {
+      const out = $('#r-out'); out.innerHTML = '<div class="note">Gemini is reading your backtest... (10 to 40 seconds)</div>';
+      try {
+        const r = await geminiReview(buildReport());
+        const rec = { text: r.text, model: r.model, note: r.note, at: new Date().toLocaleString('en-IN'), data: R.today.date };
+        store.set('lastReview', rec); renderReview();
+      } catch (e) { out.innerHTML = `<div class="note neg">Review failed: ${e.message.replace(/</g, '&lt;')}</div><div class="note">Check the key, or pick Gemini 3.6 Flash.</div>`; }
+    };
+  }
+  function renderAll() { renderToday(); renderA(); renderB(); renderPaper(); renderReview(); renderSettings(); $('#asof').textContent = 'data ' + R.today.date; }
 
   // ---------------- boot ----------------
   let busy = false;
@@ -378,7 +506,7 @@
     } catch (e) {
       console.log(e);
       status('Problem: ' + e.message + '. Check internet and tap ⟳.', true);
-      renderSettings();
+      renderSettings(); renderReview();
     } finally { busy = false; }
   }
   document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
